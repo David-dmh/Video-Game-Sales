@@ -1,0 +1,189 @@
+```{r}
+# dataset courtesy of user 'gregorut' via Kaggle:
+# https://www.kaggle.com/gregorut/videogamesales
+
+sales <- tibble::as_tibble(read.csv("vgsales.csv"))
+head(sales)
+```
+
+
+```{r}
+colnames(sales)
+for(i in c(2, 3, 4, 5, 6)){
+  sales[[i]] <- as.factor(sales[[i]])
+}
+
+# missing values
+dim(sales)
+sales <- sales[!(is.na(sales$Year)), ]
+dim(sales)
+```
+
+
+```{r}
+# bar plot of counts by platform
+par(mfrow=c(1, 1))
+barplot(sort(table(sales$Platform), decreasing=T),
+        col=rainbow(length(table(sales$Platform))),
+        space=1,
+        las=2,
+        main="Popular publishers")
+
+# " year
+plot(table(sales$Year), main="Sales per year")
+
+# " genre
+barplot(sort(table(sales$Genre), decreasing=T),
+        col=rainbow(length(table(sales$Genre))),
+        space=1,
+        las=2,
+        main="Popular genres")
+
+# " publisher (top 30)
+par(mar=c(5.1, 4.1, 1, 2.1), mgp=c(3, 0.5, 0))
+barplot(sort(table(sales$Publisher), decreasing=T)[1:30],
+        col=rainbow(30),
+        space=1,
+        las=2,
+        cex.names=0.55,
+        cex.axis=0.75,
+        main="Top 30 publishers")
+```
+
+```{r warning=FALSE}
+# going to create new sales df sales_new; dropping legacy platforms (only a few obs)
+# inspect them...
+dim(sales)
+sort(table(sales$Platform)) # drop: GG, PCFX, TG16, 3DO, SCD, WS, NG, GEN, DC
+
+# remove, if not removed it will cause issues with estimating test error since the random selection of training indices may result in a model fit which omits Platforms which,s for example, only occur once 
+items <- c("GG", "PCFX", "TG16", "3DO", "SCD", "WS", "NG", "GEN", "DC")
+for(item in items){
+  sales <- sales[sales[, 3] != item, ]
+}
+```
+
+# Creating a linear model
+
+```{r}
+set.seed(1)
+train <- sample(dim(sales)[1], round(0.8*dim(sales)[1]))
+lm_model <- lm(data=sales, Global_Sales ~ Platform + Genre + NA_Sales, subset=train)
+summary(lm_model)
+```
+
+From the above model summary, it is worth noting the highly significant p value of RPG's (Role-Playing Games).
+
+# Linear model assumptions
+
+```{r}
+# diagnostic plots
+par(mar=c(4.7, 4.5, 3.4, 2.2), mfrow=c(2, 2), mgp=c(3, 1, 0)) 
+plot(lm_model)
+```
+
+**1) Residuals vs Fitted:**  
+No discernable evidence of non-linearity. It appears that a linear model captures the model sufficiently.
+
+**2) Normal Q-Q:**  
+This plot shows a 'heavy-tailed' distribution. Most notability at lower theoretical quantile values. It can be seen that the residuals deviate significantly at higher theoretical quantile values. This could be explained by the unpredictability of extremely high or unexpectedly low sales of some games.
+
+**3) Scale-Location:**  
+There is convincing evidence of a non-random spread and therefore heteroscedasticity. I think this is to be expected due to the nature of the data being analysed. Unfortunately this violates an assumption of OLS regression to the degree of heteroscedasticity present. 
+
+**4) Residuals vs Leverage:**  
+It appears that there are a few influential cases, with the majority being well within the Cook's distance lines. It is worth removing observations 6 and 10 as seen on the plot in order to improve R210 from analysis and check R2.  
+
+Current R-squared:
+```{r}
+summary(lm_model)$r.squared
+```
+
+New R-squared:
+```{r}
+sales <- sales[-c(6, 10), ]
+lm_model <- lm(data=sales, Global_Sales ~ Platform + Genre + NA_Sales, subset=train)
+summary(lm_model)$r.squared
+```
+
+
+```{r}
+# Check linearity, excluding categorical variables
+sales_small <- sales[, -which(names(sales) %in% c("Rank", "Name", "Year", "Platform", "Genre", "Publisher"))]
+pairs(sales_small)
+```
+
+
+```{r}
+# Check collinearity
+sales_small <- sales[, -which(names(sales) %in% c("Rank", "Name", "Year", "Platform", "Genre", "Publisher", "Global_Sales"))]
+pairs(sales_small)
+```
+
+Above it can be seen that regional sales are highly collinear with global sales. As a result, only one major region should be included in model to prevent overfitting. Ideally this dataset would have more useful predictors. It should also be acknowledged that having to use any sale metric as a predictor for predicting global sales is not ideal, however due to the exploratory nature of this project, NA_Sales included. If sales predictors were included in the model, it would be unrealistic to predict global sales with high accuracy due to the poor predictive power of the non sales-related predictors. 
+
+```{r}
+# Pearson correlation matrix
+
+library(corrplot)
+correlations <- cor(sales[, 7:11])
+corrplot(correlations, method="circle")
+```
+
+# Estimating test error
+
+```{r warning=FALSE}
+# 1) Validation set
+test_set <- subset(sales[-train, ], select=c(Platform, Genre, NA_Sales))
+dim(test_set)
+sale_preds_test_set <- c()
+for(i in 1:nrow(test_set)){
+  temp_row <- test_set[i, ]
+  pred <- predict(lm_model, newdata=temp_row)
+  sale_preds_test_set <- c(sale_preds_test_set, pred)
+}
+
+predictions <- data.frame(Predicted=sale_preds_test_set, 
+                          Actual=rep(NA, length(sale_preds_test_set)))
+actual_test_set_sales <- subset(sales[-train, ], select=c(Global_Sales))
+predictions[, 2] <- actual_test_set_sales
+
+vs_mse <- mean((sales$Global_Sales - predict(lm_model, sales))[-train]^2)
+test_estimates <- data.frame(VSA=vs_mse)
+```
+
+
+```{r}
+# 2) Leave-one-out cross-validation
+library(boot)
+
+glm_fit <- glm(Global_Sales ~ Platform + Genre + NA_Sales, data=sales)
+coef(glm_fit)
+cv_err <- cv.glm(sales, glm_fit)
+cv_err$delta
+cv_te <- c(cv_err$delta[1])
+test_estimates <- cbind(test_estimates, cv_te)
+```
+
+
+```{r}
+# 3) K-fold cross-validation
+k_cv_err <- cv.glm(sales, glm_fit, K=10)
+k_cv_err$delta
+k_cv_te <- c(k_cv_err$delta[1])
+test_estimates <- cbind(test_estimates, k_cv_te)
+
+# Resulting test error estimates using each approach
+test_estimates
+```
+
+# Visualising predicted vs actual
+
+```{r}
+
+plot(predictions$Predicted, predictions$Actual, xlab="Predicted", ylab="Actual")
+abline(a=0, b=1)
+```
+
+# Concluding remarks
+Overall this project was intended to test out the linear regression workflow in R based on my study of the textbook 'Introduction to Statistical Learning'. While model accuracy was high and performed well on the test set, it requires more feature engineering to be robust - the obvious correlation between regional and global sales is a weak point, however, this project is not intended for model deployment and was just a fun exercise for myself. Ideally, after extensive feature engineering, the fit accuracy could be similar without using regional sales as a predictor.  
